@@ -8,16 +8,11 @@ DB_PATH = os.path.join(_BASE, "database", "gold.db")
 FTS_EMAILS_TABLE = "emails_fts"
 FTS_TICKETS_TABLE = "tickets_fts"
 MAX_CHUNKS = 8
-_RAG_CONN_CACHE = None
-
-
 def _get_rag_conn():
-    global _RAG_CONN_CACHE
-    if _RAG_CONN_CACHE is None:
-        _RAG_CONN_CACHE = sqlite3.connect(DB_PATH, timeout=10)
-        _RAG_CONN_CACHE.execute("PRAGMA temp_store=MEMORY")
-        _RAG_CONN_CACHE.execute("PRAGMA mmap_size=268435456")
-    return _RAG_CONN_CACHE
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA mmap_size=268435456")
+    return conn
 
 DOMAIN_KEYWORDS = {
     "hr": ["employee", "employees", "attrition", "salary", "department", "job", "hire", "resign", "overtime",
@@ -274,29 +269,32 @@ def _like_search_sales(conn, terms, max_chunks):
 
 def retrieve_context(question, max_chunks=MAX_CHUNKS):
     conn = _get_rag_conn()
-    results = []
-    terms = _extract_fts_terms(question)
+    try:
+        results = []
+        terms = _extract_fts_terms(question)
 
-    if terms:
-        results.extend(_fts_search_emails(conn, terms, max_chunks))
-        results.extend(_fts_search_tickets(conn, terms, max_chunks))
+        if terms:
+            results.extend(_fts_search_emails(conn, terms, max_chunks))
+            results.extend(_fts_search_tickets(conn, terms, max_chunks))
 
-    if len(results) < max_chunks:
-        # Only LIKE-search small tables (HR=1.4k, maintenance=10k, sales=9.8k)
-        # Emails (517k) and tickets (100k) use FTS which is already fast
-        results.extend(_like_search_hr(conn, terms, max_chunks))
-        results.extend(_like_search_maintenance(conn, terms, max_chunks))
-        results.extend(_like_search_sales(conn, terms, max_chunks))
+        if len(results) < max_chunks:
+            # Only LIKE-search small tables (HR=1.4k, maintenance=10k, sales=9.8k)
+            # Emails (517k) and tickets (100k) use FTS which is already fast
+            results.extend(_like_search_hr(conn, terms, max_chunks))
+            results.extend(_like_search_maintenance(conn, terms, max_chunks))
+            results.extend(_like_search_sales(conn, terms, max_chunks))
 
-    seen = set()
-    unique_results = []
-    for r in results:
-        key = (r["source"], r["doc_id"])
-        if key not in seen:
-            seen.add(key)
-            unique_results.append(r)
+        seen = set()
+        unique_results = []
+        for r in results:
+            key = (r["source"], r["doc_id"])
+            if key not in seen:
+                seen.add(key)
+                unique_results.append(r)
 
-    return unique_results[:max_chunks]
+        return unique_results[:max_chunks]
+    finally:
+        conn.close()
 
 
 def is_document_query(question):

@@ -1,3 +1,4 @@
+import functools
 import sqlite3
 import os
 import re
@@ -122,40 +123,81 @@ FALLBACK_QUERIES = {
 }
 
 
-def get_schema(include_cross_ref=True):
+def _normalize_tables(tables):
+    if tables is None:
+        return None
+    if isinstance(tables, str):
+        tables = [tables]
+    normalized = tuple(sorted({t.strip() for t in tables if isinstance(t, str) and t.strip()}))
+    return normalized or None
+
+
+@functools.lru_cache(maxsize=32)
+def _get_schema_cached(include_cross_ref: bool, tables: tuple[str, ...] | None = None) -> str:
     conn = get_conn()
-    tables = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE '%_fts'"
-    ).fetchall()
+    query = "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE '%_fts'"
+    rows = []
+    if tables:
+        placeholders = ",".join("?" for _ in tables)
+        rows = conn.execute(f"{query} AND name IN ({placeholders})", tables).fetchall()
+    else:
+        rows = conn.execute(query).fetchall()
+
     schema_lines = []
-    for table in tables:
+    selected_names = [row[0] for row in rows]
+    for table in rows:
         tname = table[0]
         cols = conn.execute(f"PRAGMA table_info([{tname}])").fetchall()
         col_defs = "\n".join(f"  - {c[1]} ({c[2]})" for c in cols)
         schema_lines.append(f"Table: {tname}\n{col_defs}")
+
+    if include_cross_ref and "cross_reference" not in selected_names:
+        cols = conn.execute("PRAGMA table_info([cross_reference])").fetchall()
+        if cols:
+            col_defs = "\n".join(f"  - {c[1]} ({c[2]})" for c in cols)
+            schema_lines.append(f"Table: cross_reference\n{col_defs}")
+
     conn.close()
     return "\n\n".join(schema_lines)
 
 
-def get_cross_reference_summary():
+def get_schema(include_cross_ref=True, tables=None):
+    tables = _normalize_tables(tables)
+    return _get_schema_cached(bool(include_cross_ref), tables)
+
+
+@functools.lru_cache(maxsize=32)
+def _get_cross_reference_summary_cached(domains: tuple[str, ...] | None = None) -> str:
     conn = get_conn()
-    summary = conn.execute(
-        "SELECT domain, entity_type, COUNT(*) as count FROM cross_reference GROUP BY domain, entity_type"
-    ).fetchall()
+    query = "SELECT domain, entity_type, COUNT(*) as count FROM cross_reference"
+    params = ()
+    if domains:
+        placeholders = ",".join("?" for _ in domains)
+        query = f"{query} WHERE domain IN ({placeholders})"
+        params = domains
+    query = f"{query} GROUP BY domain, entity_type"
+    summary = conn.execute(query, params).fetchall()
+
     samples = {}
     for domain, etype, _ in summary:
-        rows = conn.execute(
-            "SELECT local_id, name FROM cross_reference WHERE domain=? AND entity_type=? LIMIT 3",
-            (domain, etype)
-        ).fetchall()
+        sample_query = "SELECT local_id, name FROM cross_reference WHERE domain=? AND entity_type=? LIMIT 3"
+        rows = conn.execute(sample_query, (domain, etype)).fetchall()
         samples[f"{domain}/{etype}"] = rows
+
     conn.close()
-    lines = []
-    lines.append("cross_reference table — maps entity IDs to readable names across domains:")
+    lines = ["cross_reference table — maps entity IDs to readable names across domains:"]
     for domain, etype, count in summary:
         sample_str = "; ".join(f"{sid}: {sn}" for sid, sn in samples.get(f"{domain}/{etype}", []))
         lines.append(f"  - {domain}.{etype}: {count} entries (e.g. {sample_str})")
     return "\n".join(lines)
+
+
+def get_cross_reference_summary(domains=None):
+    if domains is None:
+        domains = None
+    else:
+        domains = tuple(sorted(set(domains)))
+    return _get_cross_reference_summary_cached(domains)
 
 
 def get_table_schema(table_name):
@@ -210,17 +252,20 @@ def _is_trivial_query(sql):
     return False
 
 
+@functools.lru_cache(maxsize=128)
 def generate_sql(question):
-    schema_text = get_schema()
+    relevant_domains = detect_relevant_domains(question)
+    tables = relevant_domains if relevant_domains else None
+    schema_text = get_schema(include_cross_ref=True, tables=tables)
     tables_info = "\n".join(f"  - {tbl}: {desc}" for tbl, desc in TABLE_DOMAINS.items())
-    cross_ref_info = get_cross_reference_summary()
+    cross_ref_info = get_cross_reference_summary(domains=relevant_domains if relevant_domains else None)
 
     prompt = f"""You are an expert SQLite SQL generator for an enterprise database.
 
 Available Tables:
 {tables_info}
 
-Full Schema (all tables including cross_reference):
+Relevant Schema (tables most likely needed for this question):
 {schema_text}
 
 {cross_ref_info}
@@ -271,10 +316,24 @@ def get_conn():
     return conn
 
 
+def _has_limit(sql: str) -> bool:
+    return bool(re.search(r"\bLIMIT\b", sql, flags=re.IGNORECASE))
+
+
+def _limit_query(sql: str, default_limit: int = 1000) -> str:
+    cleaned = sql.strip().rstrip(";")
+    if _has_limit(cleaned):
+        return cleaned
+    if cleaned.lower().startswith("with "):
+        return f"{cleaned} LIMIT {default_limit}"
+    return f"SELECT * FROM ({cleaned}) AS _subquery LIMIT {default_limit}"
+
+
 def execute_sql(sql):
     conn = get_conn()
     try:
-        df = pd.read_sql_query(sql, conn)
+        query = _limit_query(sql)
+        df = pd.read_sql_query(query, conn)
         return df, None
     except Exception as e:
         return None, f"SQL Execution Error: {e}"

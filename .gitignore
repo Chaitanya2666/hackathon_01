@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+database/
+gold_layer/
+silver_layer/
+bronze_layer/
+streamlit_demo/__pycache__/

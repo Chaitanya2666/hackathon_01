@@ -238,6 +238,8 @@ def build_dashboard(question, df, sql):
     try:
         if df is None or df.empty:
             return None
+        if len(df) > 1000:
+            df = df.head(1000)
         analysis = analyze_dataframe(df)
         kpis = compute_kpis(df, analysis)
         charts = generate_charts_matplotlib(df, analysis)
