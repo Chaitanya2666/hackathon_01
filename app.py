@@ -1,10 +1,13 @@
-import streamlit as st
-import pandas as pd
+import os
+from pathlib import Path
 
-DATA_PATH = "sample_hr.csv"
+import pandas as pd
+import streamlit as st
+
+DATA_PATH = Path(__file__).resolve().parent / "streamlit_demo" / "sample_hr.csv"
 
 @st.cache_data
-def load_data(path: str) -> pd.DataFrame:
+def load_data(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
     return df
 
